@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import http from 'node:http';
 import {
   Client,
   GatewayIntentBits,
@@ -17,6 +18,12 @@ const SOURCE_CHANNELS = (process.env.SOURCE_CHANNELS || '')
   .filter(Boolean);
 const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL;
 if (!TARGET_CHANNEL_ID) throw new Error('TARGET_CHANNEL missing from .env');
+
+/**
+ * Config (via env)
+ */
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES ?? 8 * 1024 * 1024); // default 8 MB
+const UPLOAD_DELAY_MS = Number(process.env.UPLOAD_DELAY_MS ?? 800); // ms delay between downloads/uploads
 
 const client = new Client({
   intents: [
@@ -43,11 +50,10 @@ function isImageAttachment(att: { contentType?: string | null; name?: string | n
   if (ct) return ct.startsWith('image');
   const name = att.name ?? '';
   const url = att.url ?? '';
-  return /\.(jpe?g|png|gif|webp|bmp|svg)$/i.test(name) || /\.(jpe?g|png|gif|webp|bmp|svg)$/i.test(url);
+  return /\.(jpe?g|png|gif|webp|bmp|svg|avif)$/i.test(name) || /\.(jpe?g|png|gif|webp|bmp|svg|avif)$/i.test(url);
 }
 
 function safeAuthorTag(m: Message) {
-  // message.author may be undefined on partials; try member.user fallback; finally unknown placeholder
   const author = (m.author ?? (m.member?.user as any)) as { tag?: string; username?: string } | undefined;
   if (author?.tag) return author.tag;
   if (author?.username) return `${author.username}#0000`;
@@ -58,81 +64,131 @@ function safeChannelRef(m: Message) {
   return m.channelId ?? 'unknown-channel';
 }
 
+/* -----------------------
+   Helpers: download buffers and build AttachmentBuilder[]
+   ----------------------- */
+
+async function downloadToBuffer(url: string): Promise<{ buffer: Buffer; name: string } | null> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.warn(`download failed ${url} -> ${res.status}`);
+      return null;
+    }
+    const array = await res.arrayBuffer();
+    const buf = Buffer.from(array);
+    // infer a filename from URL path or content-type
+    let filename = 'image';
+    try {
+      const pathname = new URL(url).pathname;
+      const basename = pathname.split('/').pop();
+      if (basename && basename.length > 0) filename = basename;
+    } catch { /* ignore */ }
+    if (!/\.[a-z0-9]{2,6}$/i.test(filename)) {
+      const ct = res.headers.get('content-type') ?? '';
+      const m = /image\/([a-z0-9.+-]+)/i.exec(ct);
+      const ext = m ? m[1].replace('+', '') : 'jpg';
+      filename = `${filename}.${ext}`;
+    }
+    return { buffer: buf, name: filename };
+  } catch (err) {
+    console.warn('downloadToBuffer error', err);
+    return null;
+  }
+}
+
+async function makeFilesFromUrls(urls: string[], fallbackNames: (string | undefined)[] = []) {
+  const files: AttachmentBuilder[] = [];
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[i];
+    const fallback = fallbackNames[i];
+    const d = await downloadToBuffer(url);
+    if (!d) {
+      console.warn('skipping url (download failed):', url);
+      continue;
+    }
+    if (d.buffer.byteLength > MAX_UPLOAD_BYTES) {
+      console.warn(`skipping ${d.name} (${(d.buffer.byteLength / 1024 / 1024).toFixed(2)} MB) > MAX_UPLOAD_BYTES`);
+      continue;
+    }
+    const safeName = (fallback ?? d.name).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+    files.push(new AttachmentBuilder(d.buffer, { name: safeName }));
+    await new Promise(r => setTimeout(r, UPLOAD_DELAY_MS));
+  }
+  return files;
+}
+
+/* -----------------------
+   messageCreate — download & re-upload
+   ----------------------- */
+
 client.on('messageCreate', async (message) => {
   try {
     if (message.author?.bot) return; // avoid loops
     if (!isSourceChannel(message.channelId)) return;
 
-    // image attachments (filter by contentType or filename/url)
     const imageAttachments = message.attachments.filter(att => isImageAttachment(att));
 
-    // embed / thumbnail images (type-safe)
     const embedImageUrls: string[] = [];
     for (const e of message.embeds) {
-      if (e.image?.url) {
-        embedImageUrls.push(e.image.url);
-        continue;
-      }
-      if (e.thumbnail?.url) {
-        embedImageUrls.push(e.thumbnail.url);
-        continue;
-      }
-      // some embeds place an image at embed.url — include if present
-      const maybeUrl = (e as any).url;
-      if (typeof maybeUrl === 'string' && maybeUrl) embedImageUrls.push(maybeUrl);
+      if (e.image?.url) { embedImageUrls.push(e.image.url); continue; }
+      if (e.thumbnail?.url) { embedImageUrls.push(e.thumbnail.url); continue; }
+      const maybe = (e as any).url;
+      if (typeof maybe === 'string' && maybe) embedImageUrls.push(maybe);
     }
 
-    // nothing image-like? skip
     if (imageAttachments.size === 0 && embedImageUrls.length === 0) return;
 
     const target = await client.channels.fetch(TARGET_CHANNEL_ID);
     if (!target || !target.isTextBased()) return;
     const targetChannel = target as TextChannel;
 
-    const header = `**${safeAuthorTag(message)}** from <#${safeChannelRef(message)}>`;
-
-    const files: AttachmentBuilder[] = [];
+    const urls: string[] = [];
+    const names: (string | undefined)[] = [];
     for (const att of imageAttachments.values()) {
-      // reattach by URL (works in most cases)
-      files.push(new AttachmentBuilder(att.url).setName(att.name ?? 'image'));
+      urls.push(att.url);
+      names.push(att.name ?? undefined);
     }
     for (const url of embedImageUrls) {
-      const guessedName = url.split('?')[0].split('/').pop() ?? 'image';
-      files.push(new AttachmentBuilder(url).setName(guessedName));
+      urls.push(url);
+      names.push(undefined);
     }
 
-    const sent = await targetChannel.send({
-      content: header,
-      files,
-      allowedMentions: { parse: [] }
-    });
+    const files = await makeFilesFromUrls(urls, names);
 
+    const header = `**${safeAuthorTag(message)}** from <#${safeChannelRef(message)}>`;
+    if (files.length === 0) {
+      const text = urls.join('\n');
+      const sent = await targetChannel.send({ content: `${header}\n${text}`, allowedMentions: { parse: [] } });
+      forwardMap.set(message.id, sent.id);
+      return;
+    }
+
+    const sent = await targetChannel.send({ content: header, files, allowedMentions: { parse: [] } });
     forwardMap.set(message.id, sent.id);
   } catch (err) {
-    console.error('messageCreate error', err);
+    console.error('messageCreate error (reupload)', err);
   }
 });
+
+/* -----------------------
+   messageUpdate — if images removed: delete forwarded;
+                   if forwarded exists, delete & reupload when attachments changed
+   ----------------------- */
 
 client.on('messageUpdate', async (_, newMessage) => {
   try {
     if (newMessage.partial) await newMessage.fetch().catch(() => {});
-    // newMessage might now be a Message after fetch
     const msg = newMessage as Message;
     if (!isSourceChannel(msg.channelId)) return;
 
     const imageAttachments = msg.attachments.filter(att => isImageAttachment(att));
     const embedImageUrls: string[] = [];
     for (const e of msg.embeds) {
-      if (e.image?.url) {
-        embedImageUrls.push(e.image.url);
-        continue;
-      }
-      if (e.thumbnail?.url) {
-        embedImageUrls.push(e.thumbnail.url);
-        continue;
-      }
-      const maybeUrl = (e as any).url;
-      if (typeof maybeUrl === 'string' && maybeUrl) embedImageUrls.push(maybeUrl);
+      if (e.image?.url) { embedImageUrls.push(e.image.url); continue; }
+      if (e.thumbnail?.url) { embedImageUrls.push(e.thumbnail.url); continue; }
+      const maybe = (e as any).url;
+      if (typeof maybe === 'string' && maybe) embedImageUrls.push(maybe);
     }
 
     const forwardedId = forwardMap.get(msg.id);
@@ -148,47 +204,53 @@ client.on('messageUpdate', async (_, newMessage) => {
       return;
     }
 
-    // if forwarded exists, update header only (attachments can't be edited easily)
+    // Prepare urls/names
+    const urls: string[] = [];
+    const names: (string | undefined)[] = [];
+    for (const att of imageAttachments.values()) {
+      urls.push(att.url);
+      names.push(att.name ?? undefined);
+    }
+    for (const url of embedImageUrls) {
+      urls.push(url);
+      names.push(undefined);
+    }
+
+    const files = await makeFilesFromUrls(urls, names);
+    const targetCh = (await client.channels.fetch(TARGET_CHANNEL_ID)) as TextChannel;
+
     if (forwardedId) {
-      const targetCh = (await client.channels.fetch(TARGET_CHANNEL_ID)) as TextChannel;
+      // delete old forwarded message (if exists) and resend new files/header
       const forwarded = await targetCh.messages.fetch(forwardedId).catch(() => null);
-      if (forwarded) {
-        const authorTag = safeAuthorTag(msg);
-        const channelRef = safeChannelRef(msg);
-        const header = `**${authorTag}** from <#${channelRef}> (edited)`;
-        await forwarded.edit({ content: header }).catch(() => {});
+      if (forwarded) await forwarded.delete().catch(() => {});
+      const header = `**${safeAuthorTag(msg)}** from <#${safeChannelRef(msg)}> (edited)`;
+      if (files.length === 0) {
+        const sent = await targetCh.send({ content: `${header}\n${urls.join('\n')}`, allowedMentions: { parse: [] } });
+        forwardMap.set(msg.id, sent.id);
+      } else {
+        const sent = await targetCh.send({ content: header, files, allowedMentions: { parse: [] } });
+        forwardMap.set(msg.id, sent.id);
       }
       return;
     }
 
-    // else: newMessage has images and wasn't forwarded before -> forward it
-    const target = await client.channels.fetch(TARGET_CHANNEL_ID);
-    if (!target || !target.isTextBased()) return;
-    const targetChannel = target as TextChannel;
-
-    const authorTag = safeAuthorTag(msg);
-    const channelRef = safeChannelRef(msg);
-    const header = `**${authorTag}** from <#${channelRef}> (edited)`;
-
-    const files: AttachmentBuilder[] = [];
-    for (const att of imageAttachments.values()) {
-      files.push(new AttachmentBuilder(att.url).setName(att.name ?? 'image'));
+    // If not forwarded before => forward now
+    const header = `**${safeAuthorTag(msg)}** from <#${safeChannelRef(msg)}> (edited)`;
+    if (files.length === 0) {
+      const sent = await targetCh.send({ content: `${header}\n${urls.join('\n')}`, allowedMentions: { parse: [] } });
+      forwardMap.set(msg.id, sent.id);
+    } else {
+      const sent = await targetCh.send({ content: header, files, allowedMentions: { parse: [] } });
+      forwardMap.set(msg.id, sent.id);
     }
-    for (const url of embedImageUrls) {
-      const guessedName = url.split('?')[0].split('/').pop() ?? 'image';
-      files.push(new AttachmentBuilder(url).setName(guessedName));
-    }
-
-    const sent = await targetChannel.send({
-      content: header,
-      files,
-      allowedMentions: { parse: [] }
-    });
-    forwardMap.set(msg.id, sent.id);
   } catch (err) {
-    console.error('messageUpdate error', err);
+    console.error('messageUpdate error (reupload)', err);
   }
 });
+
+/* -----------------------
+   messageDelete — delete forwarded copy if mapped
+   ----------------------- */
 
 client.on('messageDelete', async (message) => {
   try {
@@ -203,15 +265,9 @@ client.on('messageDelete', async (message) => {
   }
 });
 
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled Rejection:', err);
-});
-
-client.login(token);
-
-// --- Tiny HTTP server so Render sees an open port (for Web Service) ---
-import http from 'node:http';
-
+/* -----------------------
+   Tiny health-check server for Render Web Service
+   ----------------------- */
 const PORT = Number(process.env.PORT || 3000);
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -219,3 +275,9 @@ http.createServer((req, res) => {
 }).listen(PORT, () => {
   console.log(`[Health] Listening on port ${PORT}`);
 });
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
+});
+
+client.login(token);
